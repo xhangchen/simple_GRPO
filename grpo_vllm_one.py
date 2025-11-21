@@ -91,7 +91,19 @@ def GRPO_step(batch):
 
 
 def gen_worker(Q, physics_device):
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["CUDA_VISIBLE_DEVICES"] = f'{physics_device}'
+    cleanup_keys = [  
+            'RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT', 'LOCAL_RANK',  
+            'LOCAL_WORLD_SIZE', 'GROUP_RANK', 'ROLE_RANK', 'ROLE_NAME',   
+            'GROUP_WORLD_SIZE', 'ROLE_WORLD_SIZE',  
+            'TORCHELASTIC_RESTART_COUNT', 'TORCHELASTIC_MAX_RESTARTS',  
+            'TORCHELASTIC_RUN_ID', 'TORCHELASTIC_USE_AGENT_STORE',  
+            'TORCHELASTIC_ERROR_FILE',  
+            'TORCH_NCCL_ASYNC_ERROR_HANDLING',  
+            'NCCL_COMM_ID', 'NCCL_DEBUG', 'NCCL_SOCKET_IFNAME',  
+        ]  
+    for key in cleanup_keys: os.environ.pop(key, None)
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
     from vllm import LLM, SamplingParams
