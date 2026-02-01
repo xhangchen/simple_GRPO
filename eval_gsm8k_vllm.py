@@ -4,13 +4,16 @@
 用法示例：
   CUDA_VISIBLE_DEVICES=0 python eval_gsm8k_vllm.py --model ./step_1000
   CUDA_VISIBLE_DEVICES=0 python eval_gsm8k_vllm.py --model ./step_1000 --limit 100
+  CUDA_VISIBLE_DEVICES=0 python eval_gsm8k_vllm.py --model ./step_1000 --limit 100 --out_jsonl ./gsm8k_pred.jsonl
 
 说明：
 - `--model` 指向训练保存的断点目录（HuggingFace save_pretrained 格式）。
 - accuracy：从模型输出中提取最终数字答案，与 GSM8K 的 ground truth 做等价验证。
 - format_rate：输出是否符合 `<think>...</think><answer>...</answer>` 结构及标签数量约束。
+- `--out_jsonl`：可选，把每条样本的生成结果/解析结果落盘，便于排查 format_rate=0 的原因。
 """
 
+import json
 import re
 import argparse
 from datasets import load_dataset
@@ -60,6 +63,12 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=700)
     # 只评测前 N 条样本，便于先快速 sanity check；0 表示全量 test 集
     ap.add_argument("--limit", type=int, default=0, help="0 means full test set")
+    # 把每条样本的生成结果写入 jsonl（包含 question/gt/pred/raw_text/format_ok/is_correct）
+    ap.add_argument("--out_jsonl", default="", help="optional: path to write predictions as jsonl")
+    # 是否把完整 prompt 一起写进 jsonl（方便复现，但文件会很大）
+    ap.add_argument("--save_prompt", action="store_true", help="if set, also save full prompt into jsonl")
+    # 打印前 N 条 format 不合规的样本（快速肉眼排查）
+    ap.add_argument("--print_bad", type=int, default=0, help="print first N non-format outputs (0 disables)")
     args = ap.parse_args()
 
     # tokenizer 用来 apply_chat_template；trust_remote_code=True 便于 Qwen 等自定义实现正常加载
@@ -74,6 +83,7 @@ def main():
 
     prompts = []
     gts = []
+    questions = []
     for ex in ds:
         q = ex["question"]
         # GSM8K answer 格式类似："... #### 42"，我们只取 #### 后面的最终答案
@@ -87,6 +97,7 @@ def main():
         )
         prompts.append(prompt)
         gts.append(gt)
+        questions.append(q)
 
     # 确定性解码（temperature=0），更适合评测；max_tokens 控制输出长度
     sp = SamplingParams(n=1, temperature=0.0, top_p=1.0, max_tokens=args.max_tokens)
@@ -97,31 +108,58 @@ def main():
 
     # 批量生成（vLLM 内部会自动做 batching）；use_tqdm=True 显示进度条
     outputs = llm.generate(prompts, sp, use_tqdm=True)
-    for out, gt in zip(outputs, gts):
+    fout = open(args.out_jsonl, "w", encoding="utf-8") if args.out_jsonl else None
+    bad_printed = 0
+    for idx, (out, gt) in enumerate(zip(outputs, gts)):
         text = out.outputs[0].text
         # 统计 format 合规率
-        if format_ok(text):
+        is_format_ok = format_ok(text)
+        if is_format_ok:
             fmt += 1
+        elif args.print_bad and bad_printed < args.print_bad:
+            print(f"\n[bad_format #{bad_printed + 1}] idx={idx}")
+            print("question:", questions[idx])
+            print("raw_text:", text)
+            bad_printed += 1
 
         # 抽取最终答案（数字）；抽不到则按错误处理
         pred = extract_for_math(text)
-        if pred is None:
-            continue
+        is_correct = False
 
         try:
-            # 用 math_verify 做“等价验证”（能处理 1/2 vs 0.5 这类等价表达）
-            ans = parse(pred, extraction_config=[ExprExtractionConfig()])
-            ground_truth = parse(gt, extraction_config=[ExprExtractionConfig()])
-            if verify(ans, ground_truth):
-                correct += 1
+            if pred is not None:
+                # 用 math_verify 做“等价验证”（能处理 1/2 vs 0.5 这类等价表达）
+                ans = parse(pred, extraction_config=[ExprExtractionConfig()])
+                ground_truth = parse(gt, extraction_config=[ExprExtractionConfig()])
+                is_correct = bool(verify(ans, ground_truth))
         except Exception:
             # parse/verify 失败（格式异常等）按错误计
             pass
+        if is_correct:
+            correct += 1
+
+        if fout is not None:
+            rec = {
+                "idx": idx,
+                "question": questions[idx],
+                "gt": gt,
+                "pred_extracted": pred,
+                "is_correct": is_correct,
+                "format_ok": is_format_ok,
+                "raw_text": text,
+            }
+            if args.save_prompt:
+                rec["prompt"] = prompts[idx]
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    if fout is not None:
+        fout.close()
 
     print(f"model={args.model}")
     print(f"total={total}")
     print(f"accuracy={correct/total:.4f} ({correct}/{total})")
     print(f"format_rate={fmt/total:.4f} ({fmt}/{total})")
+    if args.out_jsonl:
+        print(f"saved_jsonl={args.out_jsonl}")
 
 if __name__ == "__main__":
     main()
